@@ -1,0 +1,7 @@
+sample_id	condition	replicate	type
+pDNA-condA	condA	NA	pDNA
+pDNA-condB	condB	NA	pDNA
+RNA-condA-rep1	condA	rep1	RNA
+RNA-condA-rep2	condA	rep2	RNA
+RNA-condB-rep1	condB	rep1	RNA
+RNA-condB-rep2	condB	rep2	RNA

@@ -1,0 +1,25 @@
+# Read structure of the barcode amplicon (R1), used by scripts/count_barcodes.py
+#
+#   pos 0                            30           42   46
+#       |                             |            |    |
+#       <----------- anchor --------> <- barcode -> <mk> ...
+#
+# Every read is matched at fixed positions: the anchor at [0:len(anchor)] and
+# the barcode immediately after it. The optional marker is a short constant
+# stretch that must follow the barcode; it catches reads whose constant region
+# carries an indel.
+#
+# If your design has no marker, set `markers: {library: ""}`.
+
+anchor: GTGCATGTGCCATAGGGATAACAGGGTAAT
+anchor_max_mm: 5          # N counts as a wildcard, not a mismatch
+
+barcode_length: 12
+
+markers:
+  library: TTGC
+marker_max_mm: 2
+
+# How many of the most abundant unassigned 60-mers to save per sample for
+# ad-hoc BLASTing (they are usually rRNA or plasmid backbone).
+top_unassigned: 100

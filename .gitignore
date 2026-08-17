@@ -1,0 +1,26 @@
+# data and results never go in git
+*.fastq
+*.fastq.gz
+*.fq.gz
+*.bam
+*.bam.bai
+*.bt2
+results/
+logs/
+work/
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*_files/
+*_cache/
+analysis/*.html
+analysis/results/
+
+# python
+__pycache__/
+*.pyc
+
+# os
+.DS_Store

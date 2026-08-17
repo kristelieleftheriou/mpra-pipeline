@@ -1,0 +1,21 @@
+name: mpra-pipeline
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - pyyaml
+  - pysam
+  - cutadapt
+  - bowtie2
+  - samtools
+  - fastqc
+  - multiqc
+  # starcode lives in its own env: conda create -n starcode -c bioconda starcode
+  - r-base>=4.3
+  - r-tidyverse
+  - r-patchwork
+  - r-ggrepel
+  - r-viridis
+  - r-rmarkdown
+  - bioconductor-deseq2

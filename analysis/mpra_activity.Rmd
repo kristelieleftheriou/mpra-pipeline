@@ -1,0 +1,347 @@
+---
+title: "MPRA: promoter activity"
+subtitle: "Barcode-level RNA/DNA ratios summarised to promoters"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: cosmo
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 6, fig.height = 4.5, dpi = 150)
+```
+
+Activity is computed per barcode as
+
+$$\text{activity} = \log_2\!\left(\frac{\text{RNA}_{\text{CPM}}}{\text{pDNA}_{\text{CPM}}} + \varepsilon\right)$$
+
+and averaged over the barcodes of each promoter. Where two conditions are
+present, `Delta = condB - condA` is the difference in promoter activity between
+them.
+
+# Setup
+
+```{r libs}
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(readr); library(tibble)
+  library(ggplot2); library(patchwork); library(ggrepel)
+  library(DESeq2)
+})
+set.seed(42)
+
+# Bioconductor packages mask dplyr verbs; make dplyr win for this session.
+filter <- dplyr::filter; select <- dplyr::select; count <- dplyr::count
+rename <- dplyr::rename; slice  <- dplyr::slice; n_distinct <- dplyr::n_distinct
+```
+
+## Parameters — edit these
+
+```{r params}
+results_dir <- "../../MPRA/results"      # output of workflow/04_build_matrix
+pba_path    <- "../../PBA/results/PBA-lib-rep1/pba/PBA-lib-rep1.pba_clean.tsv"
+out_dir     <- "results"
+
+use_starcode  <- TRUE
+starcode_dist <- 2
+
+pdna_min        <- 8    # min reads per barcode in EACH pDNA input
+min_bc_per_prom <- 5    # min barcodes for a promoter to be quantified
+delta_cut       <- 1    # |Delta| threshold for calling a difference
+
+samples <- read_tsv("../config/samples_mpra.tsv", show_col_types = FALSE) %>%
+  mutate(key = case_when(type == "pDNA" ~ paste0("pDNA_", condition),
+                         TRUE ~ paste(condition, replicate, sep = "_")))
+rna_keys  <- samples$key[samples$type == "RNA"]
+pdna_keys <- samples$key[samples$type == "pDNA"]
+
+# Condition levels: the first is the reference in every comparison.
+cond_levels <- c("condA", "condB")
+samples
+```
+
+```{r theme}
+fig_dir <- file.path(out_dir, "figures"); table_dir <- file.path(out_dir, "tables")
+for (d in c(fig_dir, table_dir)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+
+theme_pub <- function(base_size = 11) {
+  theme_classic(base_size = base_size) +
+    theme(panel.grid.major = element_line(color = "grey92", linewidth = 0.3),
+          strip.background = element_blank(),
+          strip.text = element_text(face = "bold"),
+          plot.title = element_text(face = "bold", size = base_size + 1))
+}
+cond_cols   <- setNames(c("#4C72B0", "#C44E52"), cond_levels)
+effect_cols <- c(Lower = "#08519C", Unchanged = "grey70", Higher = "#A50F15")
+
+revcomp <- function(x) {
+  x <- chartr("ACGTNacgtn", "TGCANtgcan", x)
+  vapply(strsplit(x, ""), function(z) paste(rev(z), collapse = ""), character(1))
+}
+cpm <- function(x) x / sum(x) * 1e6
+```
+
+# Count matrix
+
+```{r load-matrix}
+mat_file <- if (use_starcode)
+  sprintf("library_count_matrix.starcode_d%d.tsv", starcode_dist) else
+  "library_count_matrix.tsv"
+mat_path <- file.path(results_dir, "aggregated", mat_file)
+stopifnot(file.exists(mat_path))
+
+cnt_raw <- read_tsv(mat_path, show_col_types = FALSE)
+present <- intersect(samples$sample_id, names(cnt_raw))
+if (length(setdiff(samples$sample_id, present)))
+  warning("Missing from matrix: ",
+          paste(setdiff(samples$sample_id, present), collapse = ", "))
+
+cnt_mat <- as.matrix(cnt_raw[, present, drop = FALSE])
+rownames(cnt_mat) <- cnt_raw$barcode
+colnames(cnt_mat) <- samples$key[match(present, samples$sample_id)]
+storage.mode(cnt_mat) <- "integer"
+cat(nrow(cnt_mat), "barcodes x", ncol(cnt_mat), "samples\n")
+```
+
+## Read composition
+
+```{r qc-composition, fig.width=8, fig.height=4}
+qc <- read_tsv(file.path(results_dir, "aggregated", "qc_summary_all.tsv"),
+               show_col_types = FALSE) %>%
+  rename(sample_id = sample) %>%
+  left_join(samples, by = "sample_id") %>%
+  mutate(assigned = library_reads,
+         unassigned = total_reads - library_reads) %>%
+  select(key, type, total_reads, assigned, unassigned)
+write_tsv(qc, file.path(table_dir, "read_composition.tsv"))
+
+p_qc <- qc %>%
+  pivot_longer(c(assigned, unassigned),
+               names_to = "category", values_to = "reads") %>%
+  ggplot(aes(key, reads, fill = category)) +
+  geom_col(position = "fill") +
+  scale_fill_manual(values = c(assigned = "#08306B", unassigned = "grey80")) +
+  labs(x = NULL, y = "Fraction of reads", title = "Read composition") +
+  theme_pub() + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+p_qc
+ggsave(file.path(fig_dir, "01_read_composition.pdf"), p_qc, width = 8, height = 4)
+```
+
+# Promoter–barcode assignment
+
+```{r load-pba}
+pba <- read_tsv(pba_path, show_col_types = FALSE) %>%
+  select(promoter, barcode) %>% distinct()
+
+# Orientation check against the count matrix.
+if (length(intersect(rownames(cnt_mat), revcomp(pba$barcode))) >
+    length(intersect(rownames(cnt_mat), pba$barcode))) {
+  pba$barcode <- revcomp(pba$barcode)
+  message("Using reverse-complemented PBA barcodes.")
+}
+
+pba <- pba %>%
+  group_by(barcode) %>% filter(n_distinct(promoter) == 1) %>% ungroup() %>%
+  mutate(kind = case_when(grepl("^R[0-9]", promoter) ~ "scrambled_control",
+                          grepl("^P[0-9]", promoter) ~ "test_promoter",
+                          TRUE ~ "other_control"))
+cat(n_distinct(pba$barcode), "barcodes,", n_distinct(pba$promoter), "promoters\n")
+count(distinct(pba, promoter, kind), kind)
+```
+
+# Filtering
+
+Keep PBA barcodes seen at least `r pdna_min` times in **each** pDNA input.
+
+```{r filter}
+bc_anno <- as_tibble(cnt_mat, rownames = "barcode") %>%
+  inner_join(pba, by = "barcode") %>%
+  filter(if_all(all_of(pdna_keys), ~ .x >= pdna_min))
+
+cnt_flt <- as.matrix(bc_anno[, samples$key]); rownames(cnt_flt) <- bc_anno$barcode
+cat(nrow(bc_anno), "barcodes,", n_distinct(bc_anno$promoter), "promoters retained\n")
+```
+
+# Normalization and barcode activity
+
+Each sample is converted to counts per million over the retained barcodes, so
+sequencing depth cancels. The pDNA aliquots come from the same plasmid pool and
+are averaged into one input reference.
+
+```{r activity}
+rna_cpm  <- apply(cnt_flt[, rna_keys,  drop = FALSE], 2, cpm)
+pdna_cpm <- rowMeans(apply(cnt_flt[, pdna_keys, drop = FALSE], 2, cpm))
+
+ratio <- sweep(rna_cpm, 1, pdna_cpm, "/")
+
+# One shared pseudocount (10th percentile of non-zero ratios) so the floor is
+# identical across samples and cancels when conditions are subtracted.
+eps <- quantile(ratio[ratio > 0], 0.1, names = FALSE)
+cat("Pseudocount:", signif(eps, 3), "\n")
+
+bc_act <- log2(ratio + eps) %>%
+  as.data.frame() %>% rownames_to_column("barcode") %>%
+  pivot_longer(-barcode, names_to = "sample", values_to = "activity") %>%
+  separate(sample, c("condition", "replicate"), sep = "_") %>%
+  left_join(select(bc_anno, barcode, promoter, kind), by = "barcode")
+summary(bc_act$activity)
+```
+
+# Promoter-level activity
+
+```{r promoter-level}
+valid_prom <- bc_anno %>% count(promoter) %>%
+  filter(n >= min_bc_per_prom) %>% pull(promoter)
+
+prom_wide <- bc_act %>%
+  filter(promoter %in% valid_prom) %>%
+  group_by(promoter, kind, condition, replicate) %>%
+  summarise(activity = mean(activity, na.rm = TRUE), .groups = "drop") %>%
+  unite("sample", condition, replicate) %>%
+  pivot_wider(names_from = sample, values_from = activity)
+cat(nrow(prom_wide), "promoters with >=", min_bc_per_prom, "barcodes\n")
+```
+
+```{r replicate-correlation, fig.width=8, fig.height=4}
+pair_plot <- function(d, x, y) {
+  d <- drop_na(select(d, all_of(c(x, y))))
+  ggplot(d, aes(.data[[x]], .data[[y]])) +
+    geom_point(alpha = 0.4, size = 0.8, color = "#08306B") +
+    geom_abline(linetype = 2, color = "grey50") +
+    annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.3, size = 3.2,
+             label = sprintf("r=%.3f", cor(d[[x]], d[[y]]))) +
+    labs(x = x, y = y) + theme_pub(10)
+}
+p_rep <- pair_plot(prom_wide, paste0(cond_levels[1], "_rep1"),
+                              paste0(cond_levels[1], "_rep2")) |
+         pair_plot(prom_wide, paste0(cond_levels[2], "_rep1"),
+                              paste0(cond_levels[2], "_rep2"))
+p_rep
+ggsave(file.path(fig_dir, "02_replicate_correlation.pdf"), p_rep, width = 8, height = 4)
+```
+
+## Activity per promoter
+
+```{r summarise}
+prom_activity <- prom_wide %>%
+  mutate(A = rowMeans(across(starts_with(paste0(cond_levels[1], "_")))),
+         B = rowMeans(across(starts_with(paste0(cond_levels[2], "_")))),
+         delta = B - A,
+         effect = factor(case_when(delta <= -delta_cut ~ "Lower",
+                                   delta >=  delta_cut ~ "Higher",
+                                   TRUE ~ "Unchanged"),
+                         levels = names(effect_cols))) %>%
+  rename(!!cond_levels[1] := A, !!cond_levels[2] := B)
+
+pa <- filter(prom_activity, kind == "test_promoter")
+count(pa, effect) %>% mutate(pct = round(100 * n / sum(n), 1))
+write_tsv(prom_activity, file.path(table_dir, "promoter_activity.tsv"))
+```
+
+```{r figs-activity, fig.width=10, fig.height=4.5}
+p_rank <- prom_activity %>%
+  arrange(.data[[cond_levels[1]]]) %>%
+  mutate(rank = row_number()) %>%
+  ggplot(aes(rank, .data[[cond_levels[1]]], color = kind)) +
+  geom_point(size = 1, alpha = 0.7) +
+  labs(x = "Promoter (ranked)", y = "Activity", title = "Promoter activity") +
+  theme_pub()
+
+p_sc <- ggplot(pa, aes(.data[[cond_levels[1]]], .data[[cond_levels[2]]],
+                       color = effect)) +
+  geom_abline(linetype = 2, color = "grey50") +
+  geom_abline(slope = 1, intercept = c(-delta_cut, delta_cut),
+              linetype = 3, color = "grey70") +
+  geom_point(size = 2, alpha = 0.6) +
+  geom_text_repel(data = slice_max(pa, abs(delta), n = 10),
+                  aes(label = promoter), size = 2.5, color = "black",
+                  max.overlaps = 15) +
+  scale_color_manual(values = effect_cols) +
+  coord_equal() + theme_pub()
+
+p_rank | p_sc
+ggsave(file.path(fig_dir, "03_promoter_activity.pdf"), p_rank | p_sc,
+       width = 10, height = 4.5)
+```
+
+# Differential activity between conditions
+
+DESeq2 on per-promoter summed RNA counts, with default median-of-ratios size
+factors. Drop this section if you only need the activity table above.
+
+```{r deseq2}
+prom_counts <- bc_anno %>%
+  filter(promoter %in% valid_prom) %>%
+  group_by(promoter) %>%
+  summarise(across(all_of(samples$key), sum), .groups = "drop")
+rna_cnt <- as.matrix(prom_counts[, rna_keys]); rownames(rna_cnt) <- prom_counts$promoter
+
+coldata <- samples %>% filter(type == "RNA") %>%
+  arrange(match(key, colnames(rna_cnt))) %>%
+  mutate(condition = factor(condition, levels = cond_levels),
+         replicate = factor(replicate)) %>%
+  as.data.frame()
+rownames(coldata) <- coldata$key
+
+dds <- DESeqDataSetFromMatrix(rna_cnt, coldata, design = ~ replicate + condition)
+dds <- DESeq(dds)
+res <- results(dds, name = sprintf("condition_%s_vs_%s",
+                                   cond_levels[2], cond_levels[1]), alpha = 0.05)
+
+res_df <- as.data.frame(res) %>% rownames_to_column("promoter") %>% arrange(padj)
+write_tsv(res_df, file.path(table_dir, "differential_activity.tsv"))
+summary(res)
+```
+
+```{r volcano, fig.width=6.5, fig.height=5}
+p_vol <- res_df %>%
+  mutate(sig = case_when(is.na(padj) | padj >= 0.05 ~ "NS",
+                         log2FoldChange <= -delta_cut ~ "Lower",
+                         log2FoldChange >=  delta_cut ~ "Higher",
+                         TRUE ~ "Sig, small effect")) %>%
+  ggplot(aes(log2FoldChange, -log10(padj), color = sig)) +
+  geom_vline(xintercept = c(-delta_cut, delta_cut), linetype = 2, color = "grey70") +
+  geom_hline(yintercept = -log10(0.05), linetype = 2, color = "grey70") +
+  geom_point(alpha = 0.7, size = 1.2) +
+  scale_color_manual(values = c(Lower = "#08519C", Higher = "#A50F15",
+                                `Sig, small effect` = "#FDB863", NS = "grey80")) +
+  labs(x = expression(log[2]~fold~change), y = expression(-log[10]~adj.~p)) +
+  theme_pub()
+p_vol
+ggsave(file.path(fig_dir, "04_volcano.pdf"), p_vol, width = 6.5, height = 5)
+```
+
+Barcodes are shared between conditions, so a paired test over barcodes is an
+independent check on DESeq2.
+
+```{r paired-test}
+paired <- bc_act %>%
+  group_by(promoter, barcode, condition) %>%
+  summarise(activity = mean(activity), .groups = "drop") %>%
+  pivot_wider(names_from = condition, values_from = activity) %>%
+  drop_na(all_of(cond_levels)) %>%
+  group_by(promoter) %>% filter(n() >= min_bc_per_prom) %>%
+  summarise(n_bc = n(),
+            median_delta = median(.data[[cond_levels[2]]] - .data[[cond_levels[1]]]),
+            p = tryCatch(wilcox.test(.data[[cond_levels[2]]],
+                                     .data[[cond_levels[1]]], paired = TRUE)$p.value,
+                         error = function(e) NA_real_),
+            .groups = "drop") %>%
+  mutate(padj = p.adjust(p, "BH"))
+write_tsv(paired, file.path(table_dir, "paired_wilcoxon.tsv"))
+
+cmp <- inner_join(paired, select(res_df, promoter, log2FoldChange), by = "promoter")
+cat(sprintf("Spearman(median_delta, DESeq2 log2FC) = %.3f over %d promoters\n",
+            cor(cmp$median_delta, cmp$log2FoldChange, method = "spearman",
+                use = "pairwise"), nrow(cmp)))
+```
+
+# Session info
+
+```{r session}
+sessionInfo()
+```
